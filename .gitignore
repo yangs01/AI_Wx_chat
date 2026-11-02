@@ -98,6 +98,8 @@ frontend/.vite/
 backend/.env
 backend/.env.*
 backend/env.example
+backend/env.local
+backend/env.*
 frontend/.env
 frontend/.env.*
 
