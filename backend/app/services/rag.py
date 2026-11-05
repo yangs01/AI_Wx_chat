@@ -183,7 +183,7 @@ class RAGService:
         """基于 RAG 回答问题（非流式）"""
         # 1. 检索（优先用原始问题）
         retrieve_query = original_question or question
-        articles, chunks = self._retrieve(retrieve_query, session_id, top_k)
+        articles, chunks = self.retrieve(retrieve_query, session_id, top_k)
 
         if not articles and not chunks:
             return {
@@ -214,7 +214,7 @@ class RAGService:
         """基于 RAG 流式回答问题"""
         # 1. 检索（优先用原始问题）
         retrieve_query = original_question or question
-        articles, chunks = self._retrieve(retrieve_query, session_id, top_k)
+        articles, chunks = self.retrieve(retrieve_query, session_id, top_k)
 
         if not articles and not chunks:
             yield f"data: {json.dumps({'type': 'sources', 'sources': []}, ensure_ascii=False)}\n\n"
@@ -241,6 +241,25 @@ class RAGService:
     # ------------------------------------------------------------------ #
     #  检索层
     # ------------------------------------------------------------------ #
+
+    def retrieve(
+        self,
+        question: str,
+        session_id: Optional[str] = None,
+        top_k: int = 5,
+        verified_only: bool = False,
+        labeled_chunks_only: bool = False,
+    ) -> tuple:
+        """
+        混合检索：优先 knowledge_articles，不足再补 knowledge_chunks。
+        REST 与 MCP 共用此方法。默认过滤器关闭，保持原有问答行为。
+        """
+        articles, chunks = self._retrieve(question, session_id, top_k)
+        if verified_only:
+            articles = [a for a in articles if a.get("is_verified")]
+        if labeled_chunks_only:
+            chunks = [c for c in chunks if c.get("source") == "labeled"]
+        return articles, chunks
 
     def _retrieve(
         self, question: str, session_id: Optional[str], top_k: int

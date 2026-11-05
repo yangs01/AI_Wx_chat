@@ -11,13 +11,17 @@ from app.config import get_settings
 from app.models.database import get_engine, Base
 # 导入所有模型以确保表被创建
 from app.models.chat import RawChat, KnowledgeChunk, Session, Contact, LabeledConversation, StagingConversation, CustomConversation, Material, KnowledgeArticle, Quiz, QuizAttempt
+from app.models.mcp_ingest import McpIngestBatch, McpIngestSample  # noqa: F401  MCP 写入批次表
 from app.models.user import User
 from app.models.student import Student
 from app.models.student_report_binding import StudentReportBinding  # noqa: F401  确保 create_all 创建绑定表
 from app.routers import chats, search, knowledge, export, filter, labeling, admin, custom, materials, auth, students, extractor, quiz
 from app.services.schema_sync import ensure_legacy_material_schema, ensure_legacy_raw_chat_schema, ensure_legacy_student_schema
+from app.mcp.clients import load_clients
+from app.mcp.server import create_mcp_http_app
 
 settings = get_settings()
+mcp_http_app = create_mcp_http_app()
 
 
 @asynccontextmanager
@@ -50,7 +54,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[WARN] Database init failed: {e}")
         print("[INFO] Some features may not work without database")
-    yield
+
+    mcp_clients = load_clients(settings)  # MCP_CLIENTS 配置错误时启动即失败
+    if settings.app_env == "prod" and not mcp_clients:
+        raise RuntimeError("MCP_API_KEY or MCP_CLIENTS is required when APP_ENV=prod")
+
+    async with mcp_http_app.lifespan(app):
+        yield
     # 关闭时清理
     print("[INFO] Shutting down...")
 
@@ -87,6 +97,7 @@ app.include_router(auth.router)
 app.include_router(students.router)
 app.include_router(extractor.router)
 app.include_router(quiz.router)
+app.mount("/mcp", mcp_http_app)
 
 
 @app.get("/")

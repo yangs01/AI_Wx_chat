@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
+
+    # MCP Streamable HTTP（其他 Agent 访问已处理数据）
+    mcp_api_key: str = ""  # 兼容旧配置：映射为 client_id=default，只有 read 权限
+    # MCP client 白名单（JSON 数组），每个 client 单独授权：
+    # [{"client_id": "cs-agent", "api_key": "...", "scopes": ["read", "ingest"]}]
+    mcp_clients: str = ""
+    # MCP 写入（ingest_samples）允许的业务场景，逗号分隔；未列出的 scenario 一律拒绝
+    mcp_ingest_scenarios: str = "sales_chat,badcase"
     
     # 服务配置
     api_host: str = "0.0.0.0"

@@ -16,6 +16,7 @@
 - 🎓 **学生管理** - 学生信息录入、AI 图片识别批量导入
 - 🔐 **用户认证** - JWT 登录认证，角色权限控制
 - 📝 **AI 考核** - 基于知识库自动出题、AI 评分、成绩统计
+- 🔌 **MCP 接入** - Streamable HTTP，供其他 Agent 读取已审核知识，不暴露原始微信聊天；授权的 Agent 可写入新样本，停在暂存区等人工审核
 
 ## ✨ 功能模块
 
@@ -84,6 +85,13 @@
 - 考核记录管理，支持人工复核
 - 按场景分类出题（销售/异议/成交等）
 
+### 🔌 MCP（其他 Agent 接入）
+- **Streamable HTTP** - 挂在同一后端进程的 `/mcp`，与 REST 共用数据库和检索服务
+- **只读已处理数据** - 知识条目、已标注切片、已审核训练样本；不含原始微信聊天
+- **Bearer 鉴权** - 每个 client 一把 key（`MCP_CLIENTS`），按权限项授权；与用户 JWT 分开
+- **受控写入** - `ingest_samples` 需单独的 `ingest` 权限，样本走完整流水线后停在暂存区 `pending`，不会直接进入已审核数据
+- **分页抽样** - 导出工具单次最多 50 条，避免整库倾倒
+
 ### 🛡️ 数据安全
 - **敏感信息脱敏** - 自动隐藏手机号、身份证等
 - **垃圾过滤** - 移除无意义内容
@@ -111,7 +119,10 @@
 │  │ rag │ rag_distiller │ rag_rewriter │ knowledge │ embedding        │  │
 │  │ admin │ etl │ filter │ training_data │ quality_scorer              │  │
 │  │ extractor │ data_generator │ quiz │ auth │ mask_service            │  │
-│  │ tos_service │ vision_service │ schema_sync                        │  │
+│  │ tos_service │ vision_service │ schema_sync │ export_format         │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│  ┌─ MCP /mcp (Streamable HTTP + Bearer) ─────────────────────────────┐  │
+│  │ retrieve │ articles │ stats │ approved export samples             │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 │  ┌─ Deps ────────────────────────────────────────────────────────────┐  │
 │  │ get_current_user │ get_optional_user │ require_admin              │  │
@@ -137,6 +148,7 @@
 | **后端** | FastAPI | 高性能异步 API（自动 Swagger 文档） |
 | | SQLAlchemy + Pydantic | ORM + 数据验证 |
 | | python-jose (JWT) | 用户认证与权限控制 |
+| | FastMCP | Streamable HTTP MCP，供其他 Agent 读取已处理知识 |
 | | uv | Python 依赖管理与运行 |
 | **数据库** | PostgreSQL 17 + pgvector | 关系数据 + 向量检索 |
 | **AI / ML** | DashScope API | 云端 Embedding（text-embedding-v3） |
@@ -262,6 +274,14 @@ AiWxChat/
 │   │   │   ├── chat.py        # 聊天/标注/知识/素材/考核模型
 │   │   │   ├── user.py        # 用户模型（角色权限）
 │   │   │   └── student.py     # 学生模型
+│   │   ├── mcp/               # MCP 适配层（Streamable HTTP）
+│   │   │   ├── server.py      # FastMCP 注册与 /mcp 挂载
+│   │   │   ├── auth.py        # Bearer 鉴权，按 key 识别 client
+│   │   │   ├── clients.py     # client 白名单与权限项（read / ingest）
+│   │   │   ├── scopes.py      # 读取类工具要求 read 权限
+│   │   │   ├── audit.py       # 写入审计日志（不含原文）
+│   │   │   ├── serializers.py # 去掉内部字段、截断文本
+│   │   │   └── tools/         # retrieve / articles / export / stats / ingest
 │   │   ├── routers/           # API 路由
 │   │   │   ├── chats.py       # 聊天记录
 │   │   │   ├── search.py      # 搜索
@@ -295,7 +315,8 @@ AiWxChat/
 │   │       ├── tos_service.py    # 火山引擎 TOS 对象存储
 │   │       ├── vision_service.py # 豆包视觉 AI（图片识别）
 │   │       ├── schema_sync.py    # 数据库 Schema 自动补丁
-│   │       └── staging_text.py   # 暂存区文本处理
+│   │       ├── staging_text.py   # 暂存区文本处理
+│   │       └── export_format.py  # 已审核数据导出格式（REST 与 MCP 共用）
 │   └── scripts/
 │       ├── run_etl.py         # ETL 执行脚本
 │       ├── explore_db.py      # 数据库探索
@@ -406,6 +427,11 @@ JWT_SECRET_KEY=your-secret-key
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 REFRESH_TOKEN_EXPIRE_DAYS=7
 
+# ─── MCP（其他 Agent 接入，APP_ENV=prod 时二者至少配一个）───
+MCP_API_KEY=your-service-token          # 旧的共享 key，只有 read 权限
+MCP_CLIENTS=[{"client_id":"cs-agent","api_key":"<随机长 key>","scopes":["read","ingest"]}]
+MCP_INGEST_SCENARIOS=sales_chat,badcase # ingest_samples 允许的 scenario
+
 # ─── 服务配置 ───
 APP_ENV=dev                            # dev / prod
 ```
@@ -476,6 +502,138 @@ APP_ENV=dev                            # dev / prod
 | 后端 API | 8000 | FastAPI |
 | PostgreSQL | 5432 | 数据库 |
 | API 文档 | 8000/docs | Swagger UI |
+| MCP | 8000/mcp | Streamable HTTP，供其他 Agent 读取已处理知识、写入待审核样本 |
+
+## MCP（其他 Agent 接入）
+
+已审核的销售知识通过 Streamable HTTP MCP 挂在同一后端进程的 `/mcp`。MCP 是薄适配层：进程内调用现有检索 / 导出服务，**不**再包一层 REST，也**不**暴露原始微信聊天。获得 `ingest` 权限的 Agent 还可以把新样本（线上对话、badcase）推进流水线，见下文「写入样本」。
+
+前端 UI 继续走 REST。其他 Agent 只走 MCP。
+
+### 能读到什么
+
+| 可暴露 | 不暴露 |
+|--------|--------|
+| `knowledge_articles`（默认只要已验证） | `raw_chats` / `contacts` / `sessions` |
+| `knowledge_chunks` 且 `chunk_type=labeled` | 暂存区 `pending` / `rejected`、`original_text` |
+| `staging_conversations` 且 `status=approved` | embedding、`source_session_id`、wxid |
+| 启用中的 `custom_conversations` | 后台 ETL / 重建知识库 / 提炼任务 |
+
+### 工具与资源
+
+| 名称 | 作用 |
+|------|------|
+| `retrieve_sales_knowledge` | 混合检索：知识条目优先，已标注切片兜底。调用方用自己的 LLM 生成回答 |
+| `search_knowledge_articles` | 结构化知识条目语义搜索 |
+| `list_knowledge_articles` / `get_knowledge_article` | 浏览或按 id 读取一条 |
+| `get_knowledge_corpus_stats` | 语料规模（条目、已标注切片、已审核对话） |
+| `preview_approved_training_data` | 已审核训练样本预览（ShareGPT / Alpaca / OpenAI / JSONL / RAG） |
+| `export_approved_rag_entries` | 规则清洗后的 RAG 问答对。单次最多 50 条 |
+| `knowledge://stats` | 与 stats 工具相同的资源读法 |
+| `knowledge://articles/{id}` | 单条知识条目 |
+| `ingest_samples` | 写入新样本，停在暂存区待审核（需 `ingest` 权限） |
+| `get_ingest_status` | 查询自己写入批次的审核状态（需 `ingest` 权限） |
+
+每条结果都会去掉内部字段、截断过长文本；导出默认排除价格数据。
+
+### 写入样本（ingest）
+
+线上客服 Agent、Eval 系统等可以把新样本推给 Data Engine。写入**不会**直接进入已审核数据，每条样本都走现有流水线：
+
+```
+脱敏（DataFilter.desensitize） → 去重 → raw_chats（不可变） → 过滤规则 → staging_conversations（pending）→ 人工审核
+```
+
+- **来源标签**：raw 和暂存区记录都带 `source = mcp:<client_id>`，暂存区的 `session_id` 以 `mcp:<client_id>:` 开头，审核时能看出是谁写的
+- **幂等**：同一个 client 用同一个 `idempotency_key` 重复提交，返回原批次，不会重复写入；同 key 不同内容返回 `IDEMPOTENCY_CONFLICT`
+- **去重**：与之前写入的样本、或暂存区已有对话内容相同的样本，标记为 `deduplicated`，不进 raw
+- **过滤**：全部消息被过滤规则排除的样本标记为 `filtered`，并附过滤原因（如 `short×2`、`spam×1`）
+- **不信任内容**：样本文本只当数据存储，不会被当作指令执行，也不会送进 LLM（写入时关闭了 LLM 质量打分，用规则评分）
+- **限制**：单次最多 50 条样本，每条最多 20 轮，每轮最多 2000 字；`scenario` 必须在 `MCP_INGEST_SCENARIOS` 里
+
+示例调用（FastMCP Python 客户端）：
+
+```python
+from fastmcp import Client
+
+async with Client("http://<host>:8000/mcp", auth="<cs-agent 的 key>") as client:
+    result = await client.call_tool("ingest_samples", {
+        "source": "online_chat",            # 业务来源：[a-z0-9_-]{1,32}
+        "scenario": "sales_chat",           # 必须在 MCP_INGEST_SCENARIOS 里
+        "idempotency_key": "cs-2026-11-04-0001",
+        "samples": [{
+            "external_id": "conv-8812",     # 可选，调用方自己的 ID
+            "messages": [
+                {"role": "user", "content": "这个课程适合零基础吗？"},
+                {"role": "assistant", "content": "适合的，从 Python 基础讲起。"},
+            ],
+        }],
+    })
+    batch_id = result.structured_content["batch_id"]
+    status = await client.call_tool("get_ingest_status", {"batch_id": batch_id})
+```
+
+`ingest_samples` 返回：
+
+```json
+{
+  "batch_id": "b_cd5529134d88443592208fc4110bd2ac",
+  "status": "completed",
+  "replayed": false,
+  "source": "mcp:cs-agent",
+  "origin": "online_chat",
+  "scenario": "sales_chat",
+  "counts": {"total": 3, "staged": 1, "deduplicated": 1, "filtered": 1},
+  "results": [
+    {"index": 0, "external_id": "conv-8812", "outcome": "staged", "staging_ids": [412]},
+    {"index": 1, "external_id": "conv-8813", "outcome": "deduplicated",
+     "reason": {"code": "duplicate", "matched": "existing_staging_data", "message": "与 staging 中已有的对话内容相同"}},
+    {"index": 2, "external_id": "conv-8814", "outcome": "filtered",
+     "reason": {"code": "filtered_by_rule", "categories": {"short": 2}, "message": "全部消息被过滤规则排除：short×2"}}
+  ]
+}
+```
+
+`get_ingest_status` 按样本返回 `review_status`：`pending_review` / `approved` / `rejected` / `edited`（对应库里的 `pending` / `approved` / `rejected` / `modified`）。被去重或过滤的样本没有进入审核，`review_status` 为 `null`，并带上原因。只能查询自己写入的批次。
+
+出错时返回结构化错误，不带异常栈：`{"error": "<说明>", "code": "..."}`，`code` 为 `FORBIDDEN`、`INVALID_ARGUMENT`、`UNKNOWN_SCENARIO`、`IDEMPOTENCY_CONFLICT`、`NOT_FOUND`、`INTERNAL` 之一。`INTERNAL` 时用同一个 `idempotency_key` 重试会续跑未完成的样本。
+
+每次写入在 `mcp_ingest_batches` 表留一条记录，并在 `app.mcp.audit` 日志写一行 JSON（client_id、scenario、样本数、结果统计），不记录样本原文。
+
+### 客户端配置与权限
+
+每个接入方单独一把 key，按权限项授权。**有 `read` 不代表能写**，写入必须显式授予 `ingest`：
+
+```bash
+# 每个 client 一项；api_key 至少 16 位，不同 client 不能共用
+MCP_CLIENTS=[{"client_id":"cs-agent","api_key":"<随机长 key>","scopes":["read","ingest"]},{"client_id":"dashboard","api_key":"<随机长 key>","scopes":["read"]}]
+# 旧的共享 key 仍可用，视为 client_id=default，只有 read 权限
+MCP_API_KEY=your-service-token
+# ingest_samples 允许的 scenario
+MCP_INGEST_SCENARIOS=sales_chat,badcase
+```
+
+| 权限项 | 能做什么 |
+|--------|----------|
+| `read` | 所有读取类工具与资源（与原来一致） |
+| `ingest` | `ingest_samples`、`get_ingest_status` |
+
+`APP_ENV=prod` 时 `MCP_API_KEY` 和 `MCP_CLIENTS` 都为空会拒绝启动；`MCP_CLIENTS` 格式错误也会在启动时报错。
+
+```json
+{
+  "mcpServers": {
+    "aiwxchat-knowledge": {
+      "url": "http://<host>:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+本地联调可用 [MCP Inspector](https://github.com/modelcontextprotocol/inspector) 指向 `http://localhost:8000/mcp`，请求头带上 `Authorization: Bearer <MCP_API_KEY>`。整库下载仍走人类用的 `/api/export/labeled/dataset`，不走 MCP。
 
 ## ❓ 常见问题
 
@@ -494,6 +652,9 @@ APP_ENV=dev                            # dev / prod
 ### Q: Embedding 模型如何配置？
 项目使用阿里 DashScope 的 `text-embedding-v3` 云端 API，需要在 `.env` 中配置 `ARK_API_KEY`。无需本地下载模型。
 
+### Q: 其他 Agent 怎么读这份知识库？
+在 `MCP_CLIENTS` 里给它一把只有 `read` 权限的 key（或用旧的 `MCP_API_KEY`），把客户端指到 `http://<host>:8000/mcp`。MCP 只返回已审核数据，不含原始微信聊天。需要写入样本的 Agent 另外授予 `ingest` 权限。
+
 ### Q: 端口被占用？
 ```bash
 docker compose down
@@ -508,6 +669,7 @@ MIT License
 ## 🙏 致谢
 
 - [FastAPI](https://fastapi.tiangolo.com/)
+- [FastMCP](https://gofastmcp.com/)
 - [pgvector](https://github.com/pgvector/pgvector)
 - [uv](https://docs.astral.sh/uv/)
 - [React](https://react.dev/)

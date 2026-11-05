@@ -31,7 +31,16 @@ class DataFilter:
         'email': r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # 邮箱
         'ip_address': r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}',  # IP地址
         'api_key': r'(?:sk-|ak-|api[_-]?key)[a-zA-Z0-9]{20,}',  # API Key
+        'secret_token': r'(?:sk-[A-Za-z0-9_-]{20,}|A[KS]IA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,})',  # 现行格式密钥
     }
+
+    # 现行格式密钥（sk-proj- / sk-ant- / AWS / GitHub），只保留可识别的前缀。
+    # 不用 \b：中文紧贴密钥时（如「密钥sk-...」）也要命中。
+    SECRET_TOKEN_MASKS = [
+        (r'sk-[A-Za-z0-9_-]{20,}', 'sk-***'),
+        (r'(A[KS]IA)[0-9A-Z]{16}', r'\1***'),
+        (r'(gh[pousr]_)[A-Za-z0-9]{30,}', r'\1***'),
+    ]
     
     # 无意义内容模式
     CHITCHAT_PATTERNS = [
@@ -147,7 +156,11 @@ class DataFilter:
         对敏感信息进行脱敏处理
         """
         result = content
-        
+
+        # 现行格式密钥先整体替换，避免后面的数字规则只打掉一部分
+        for pattern, replacement in self.SECRET_TOKEN_MASKS:
+            result = re.sub(pattern, replacement, result)
+
         # 手机号脱敏: 138****1234
         result = re.sub(
             r'(1[3-9]\d)\d{4}(\d{4})',
